@@ -368,6 +368,24 @@ def _query_conn() -> psycopg.Connection:
     )
 
 
+def query_conn() -> psycopg.Connection:
+    """恢复实例的只读查询连接（供站点质控等查询复用）。"""
+    return _query_conn()
+
+
+def instance_data_dir() -> str | None:
+    """当前 55433 实例的数据目录（SHOW data_directory）。
+
+    用于核对实例身份：实例被取代切换后，目录与任务记录不一致，
+    查询方必须拒绝，避免把新时点数据当成旧任务的结果返回。
+    """
+    try:
+        with _control_conn() as con:
+            return con.execute("SHOW data_directory").fetchone()[0]
+    except Exception:
+        return None
+
+
 def fetch_samples(station_no: str | None, sample_no: str | None,
                   limit: int) -> list[dict]:
     sql = ("SELECT id, sample_no, station_no, ph::float8 AS ph, created_at"

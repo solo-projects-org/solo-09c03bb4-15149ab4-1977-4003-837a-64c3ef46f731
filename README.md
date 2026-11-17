@@ -11,12 +11,16 @@
 - 查询只打恢复实例，**绝不用当前源库冒充恢复结果**；
 - WAL 未归档齐备时任务显示等待、不开放目标查询；
 - 失败或 API 重启后可按原核对点重试；一次只恢复一项；全程不改写生产库。
+- **站点 pH 突变质控**：同站按样品 id 排序，首条可供数，与前条 pH 差值
+  严格大于 2 标为待复核；判定与依据由源库触发器在样品变更的**原事务**内
+  持久化；可查当前源库或指定已就绪恢复任务（核对点时点）的质控结果。
 
 ## 快速开始
 
 ```bash
 docker compose up -d --build        # 启动源库 + API（首次自动做基准备份）
 python3 scripts/demo.py             # 端到端演示：更正 / 误删 / 跨点事务 + 恢复校验
+python3 scripts/demo_qc.py          # 端到端演示：站点 pH 突变质控（需全新环境）
 ```
 
 Swagger 文档：<http://localhost:8000/docs>
@@ -60,7 +64,46 @@ Swagger 文档：<http://localhost:8000/docs>
 | 不把半库报成功 | pause 后校验 `pg_last_wal_replay_lsn() >= 核对点 LSN` 才 promote；再查 `samples`  sanity + `default_transaction_read_only=on` 才置 `ready`；任何异常 → `failed` + 日志 |
 | 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时进行中任务自动重新排队、ready 实例自动拉起 |
 | 一次只恢复一项 | 有进行中任务时 `POST /api/recoveries` 返回 409；新任务就绪前会把旧 ready 实例停掉并标记 `superseded` |
-| 源库可写、不被改写 | 基准备份/恢复点均为在线只读操作；API 对源库不执行任何 DML；归档卷对 API 只读挂载 |
+| 源库可写、不被改写 | 基准备份/恢复点均为在线只读操作；归档卷对 API 只读挂载；API 对源库唯一的写操作是运维显式触发的 `POST /api/qc/enable`（见下节） |
+
+## 站点质控（pH 突变）
+
+质控员要找某站 pH 突变样品、给分析组提供可供数记录。判定规则：
+
+> 同站按样品 id 排序：**首条可供数**；其余与前一条 pH 差值**严格大于 2** 的标为**待复核**（差值恰好 2.00 不算突变）。
+
+**启用（一次性，幂等）**：`POST /api/qc/enable` 在源库单事务内完成
+建表（`public.sample_qc`）+ 同步触发器 + 已有样品回填（已有样品照此判定）。
+这是 API 对源库**唯一**的写操作，且只在运维显式调用时发生；
+启用前会 `LOCK TABLE` 短暂阻塞写入，保证回填不漏数。
+
+**原事务内持久化**：启用后，生产库直接新增 / 更正 / 迁站 / 删除样品时，
+BEFORE 触发器先取该站点的**事务级咨询锁**（迁站按站名排序取两把，防死锁），
+AFTER 触发器在同一事务内重算"自身 + 受影响邻项（同站后继）"的判定与依据
+（前值样品、前值 pH、差值、文字说明）写入 `sample_qc`：
+
+- 质控记录随业务事务一起提交/回滚，**回滚不留错配**；
+- 同站并发写入被咨询锁串行化，**并发不留错配**；
+- 每条质控响应都附 `consistency` 字段：持久化记录 vs 按规则现算的逐样品核对结果。
+
+**查询**：
+
+- `GET /api/qc/stations/{station_no}` — 当前源库实时质控（明确标注非恢复结果）；
+- `GET /api/recoveries/{id}/qc/stations/{station_no}` — 指定已就绪恢复任务的
+  核对点时点质控。响应含每条样品的判定（可供数/待复核）、前值、依据，
+  以及可供数样品清单。
+
+**恢复实例的质控语义**：
+
+- 质控结果与样品一样属于所选核对点：恢复实例由 WAL 重放构建，
+  启用后登记的核对点恢复出来自带该时点的质控记录；
+- **启用质控前的核对点**：恢复实例中不存在质控表，查询返回 409 并明确提示
+  "早于质控启用时点"（样品数据仍可查）；
+- **实例切换不混时点**：查询前核对 55433 实例的数据目录与任务记录一致，
+  实例被取代后旧任务的质控/样品查询一律 409，不会把新时点数据混进旧任务。
+
+> 说明：单条 DML 语句的并发质控重算已串行化无死锁；跨站点的多语句事务
+> 与常规并发更新一样可能被数据库判死锁中止——回滚后重试即可，不会产生错配。
 
 ## API 一览
 
@@ -77,6 +120,10 @@ Swagger 文档：<http://localhost:8000/docs>
 | DELETE | `/api/recoveries/{id}` | 取消进行中任务 / 停止已就绪实例 |
 | GET | `/api/recoveries/{id}/samples` | 查询恢复实例样品（`station_no`/`sample_no` 过滤，仅 `ready` 后开放） |
 | POST | `/api/recoveries/{id}/query` | 只读 SQL（演示用，限单条 SELECT，连接强制只读兜底） |
+| POST | `/api/qc/enable` | 在源库启用质控（建表 + 触发器 + 已有样品回填，单事务，幂等） |
+| GET | `/api/qc/status` | 质控启用状态与启用历史 |
+| GET | `/api/qc/stations/{station_no}` | 当前源库的站点质控（实时，含一致性核对） |
+| GET | `/api/recoveries/{id}/qc/stations/{station_no}` | 恢复实例的站点质控（仅 `ready` 且该时点已启用质控） |
 
 ### 恢复任务状态机
 
@@ -108,6 +155,23 @@ curl -s localhost:8000/api/recoveries/1
 curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 ```
 
+质控操作示例：
+
+```bash
+# 1. 启用质控（一次性，幂等；已有样品照规则回填）
+curl -s -X POST localhost:8000/api/qc/enable
+
+# 2. 源库直接变更（判定与依据在原事务内持久化）
+docker compose exec db psql -U postgres -d water \
+  -c "INSERT INTO samples (sample_no, station_no, ph) VALUES ('S-2026-0010','ST-01',9.20)"
+
+# 3. 查当前源库站点质控（突变样品标为待复核，附前值与依据）
+curl -s localhost:8000/api/qc/stations/ST-01
+
+# 4. 查恢复实例（核对点时点）的站点质控
+curl -s localhost:8000/api/recoveries/1/qc/stations/ST-01
+```
+
 ## 限制与说明
 
 - 演示环境口令为 `postgres/postgres`（scram-sha-256，复制连接已在 `db/init/02_hba.sh` 放行），生产使用请更换口令并收敛 pg_hba；
@@ -127,3 +191,12 @@ curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 - 并发第二个恢复请求返回 409；新任务就绪时旧实例被 `superseded`；
 - 恢复实例直连写入被数据库拒绝（read-only transaction），`/query` 非 SELECT 与多语句被 400 拦截；
 - 强制重做基准备份后旧核对点自动 `expired`，恢复过期核对点返回 409。
+
+质控功能（PostgreSQL 16.9/16.15 同拓扑实测，`scripts/demo_qc.py` 全部断言 PASS）：
+
+- 启用后已有样品按规则回填；新增突变样品判待复核并记录前值/差值/依据；
+- 更正后自身与邻项联动重算；迁站两站联动；删除后质控记录同步移除；
+- 差值恰好 2.00 判可供数（严格大于 2 才待复核）；
+- 事务内即可查到质控记录，回滚后无残留；8 进程并发写入 + 更正/迁站/删除/回滚混合后一致性核对通过（多轮无死锁）；
+- 启用前核对点恢复后查询质控返回 409 明确提示，样品仍可查；
+- 恢复实例质控属于所选核对点时点；实例切换后旧任务质控/样品查询均 409。

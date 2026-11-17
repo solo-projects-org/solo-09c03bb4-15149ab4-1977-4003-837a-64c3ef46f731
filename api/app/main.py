@@ -1,7 +1,9 @@
 """水质数仓单实例 PITR 恢复 API。
 
 职责：物理基准备份 + WAL 持续归档之上，登记命名核对点，
-把核对点恢复到独立只读实例并开放样品查询。Swagger 见 /docs。
+把核对点恢复到独立只读实例并开放样品查询；另提供站点 pH 突变
+质控（当前源库实时查询或指定已就绪恢复任务的历史时点查询）。
+Swagger 见 /docs。
 """
 import os
 import threading
@@ -10,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import backuper, config, recoverer, source, state
+from . import backuper, config, qc, recoverer, source, state
 from .walutil import lsn_to_int
 
 _stop = threading.Event()
@@ -23,7 +25,10 @@ DESCRIPTION = """
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
   产出**独立只读**实例；跨点后才提交的事务不会出现；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项；失败或重启后可按原核对点重试；
+* 站点质控：同站按样品 id 排序，首条可供数，与前条 pH 差值严格大于 2
+  标为待复核；判定与依据由源库触发器在样品变更的**原事务**内持久化，
+  可查当前源库或指定已就绪恢复任务（核对点时点）的质控结果。
 """
 
 
@@ -137,7 +142,7 @@ def _ensure_no_active_job() -> None:
 def root():
     return {"service": "水质数仓 PITR 恢复服务", "docs": "/docs",
             "api": ["/api/health", "/api/basebackup", "/api/checkpoints",
-                    "/api/recoveries"]}
+                    "/api/recoveries", "/api/qc/stations/{station_no}"]}
 
 
 @app.get("/api/health", summary="健康检查")
@@ -275,7 +280,23 @@ def _ready_job_or_409(job_id: int) -> dict:
     if job["status"] != "ready":
         raise HTTPException(
             409, f"恢复任务未就绪（当前状态 {job['status']}），目标查询未开放")
+    _verify_instance_identity(job)
     return job
+
+
+def _verify_instance_identity(job: dict) -> None:
+    """核对 55433 上运行的确实是该任务的实例。
+
+    实例被取代切换后端口会复用：若目录对不上，说明该任务的实例已不在，
+    继续查询会把新时点的数据混进旧任务的结果，必须拒绝。
+    """
+    expect = job.get("data_dir")
+    actual = recoverer.instance_data_dir()
+    if not expect or not actual or \
+            os.path.realpath(expect) != os.path.realpath(actual):
+        raise HTTPException(
+            409, "恢复实例已切换（当前实例不属于该任务），为避免混入其他时点"
+                 "的数据，请改用最新 ready 任务查询")
 
 
 def _query_meta(job: dict) -> dict:
@@ -316,3 +337,63 @@ def adhoc_query(job_id: int, body: QueryIn):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"查询恢复实例失败: {e}")
     return {**_query_meta(job), "row_count": len(rows), "rows": rows}
+
+
+# ------------------------------------------------------------------ 站点质控
+
+@app.post("/api/qc/enable", tags=["qc"],
+          summary="在源库启用质控（建表 + 触发器 + 已有样品回填，幂等）")
+def enable_qc():
+    try:
+        return qc.enable_on_source()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"在源库启用质控失败: {e}")
+
+
+@app.get("/api/qc/status", tags=["qc"], summary="质控启用状态")
+def qc_status():
+    enabled = qc.source_qc_enabled()
+    return {
+        "source_qc_enabled": enabled,
+        "rule": qc.RULE_TEXT,
+        "enable_history": state.all_rows(
+            "SELECT * FROM qc_enable_log ORDER BY id DESC LIMIT 5"),
+        "note": None if enabled else
+                "源库尚未启用质控：POST /api/qc/enable 后，样品变更将在"
+                "原事务内持久化质控判定及依据",
+    }
+
+
+@app.get("/api/qc/stations/{station_no}", tags=["qc"],
+         summary="当前源库的站点质控（实时，含一致性核对）")
+def qc_station_live(station_no: str):
+    if not qc.source_qc_enabled():
+        raise HTTPException(
+            409, "源库尚未启用质控，请先 POST /api/qc/enable；"
+                 "启用前的样品没有质控记录")
+    try:
+        with source.query_conn() as con:
+            report = qc.build_report(con, station_no)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"查询源库质控失败: {e}")
+    return {"queried_from": "source-live（当前源库实时数据，非恢复结果）",
+            **report}
+
+
+@app.get("/api/recoveries/{job_id}/qc/stations/{station_no}", tags=["qc"],
+         summary="恢复实例的站点质控（仅 ready 且该时点已启用质控）")
+def qc_station_recovery(job_id: int, station_no: str):
+    job = _ready_job_or_409(job_id)  # 含实例身份核对，防止混入其他时点
+    try:
+        with recoverer.query_conn() as con:
+            if not qc.available(con):
+                raise HTTPException(
+                    409, f"核对点 {job['checkpoint_name']} 早于质控启用时点，"
+                         f"恢复实例中不存在质控记录，不可查询质控；"
+                         f"样品数据仍可查 /api/recoveries/{job_id}/samples")
+            report = qc.build_report(con, station_no)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"查询恢复实例质控失败: {e}")
+    return {**_query_meta(job), **report}

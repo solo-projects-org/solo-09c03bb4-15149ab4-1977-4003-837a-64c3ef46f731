@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at       TEXT NOT NULL,
     ready_at         TEXT
 );
+CREATE TABLE IF NOT EXISTS qc_enable_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    enabled_at TEXT NOT NULL,
+    lsn        TEXT,                    -- 启用完成时源库 WAL 位点（信息记录）
+    detail     TEXT
+);
 """
 
 # 进行中（未终结）的任务状态：一次只允许一个
